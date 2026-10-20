@@ -211,6 +211,35 @@ where
     }
 }
 
+/// Trait for producing the delays between reconnect attempts.
+pub trait ReconnectBackoff: Sync + Send + 'static {
+    /// Returns the delays to wait between reconnect attempts.
+    ///
+    /// Called each time the session loses its connection, so each disconnect
+    /// starts from the first delay. Reconnecting stops when the iterator ends.
+    fn delays(&self) -> Box<dyn Iterator<Item = Duration> + Send>;
+}
+
+impl<F, I> ReconnectBackoff for F
+where
+    F: Fn() -> I + Send + Sync + 'static,
+    I: IntoIterator<Item = Duration>,
+    I::IntoIter: Send + 'static,
+{
+    fn delays(&self) -> Box<dyn Iterator<Item = Duration> + Send> {
+        Box::new(self().into_iter())
+    }
+}
+
+/// The default reconnect backoff.
+///
+/// Exponential from 50ms, capped at 30s, with full jitter.
+pub fn default_reconnect_backoff() -> impl Iterator<Item = Duration> + Send + 'static {
+    ExponentialBackoff::from_millis(50)
+        .max_delay(Duration::from_secs(30))
+        .map(jitter)
+}
+
 /// The default ngrok connector.
 ///
 /// Establishes a TCP connection to `addr`, and then performs a TLS handshake
@@ -334,6 +363,7 @@ pub struct SessionBuilder {
     ca_cert: Option<bytes::Bytes>,
     tls_config: Option<rustls::ClientConfig>,
     connector: Arc<dyn Connector>,
+    reconnect_backoff: Arc<dyn ReconnectBackoff>,
     handlers: CommandHandlers,
     cookie: Option<SecretString>,
     id: Option<String>,
@@ -427,6 +457,7 @@ impl Default for SessionBuilder {
             ca_cert: None,
             tls_config: None,
             connector: Arc::new(default_connect),
+            reconnect_backoff: Arc::new(default_reconnect_backoff),
             handlers: Default::default(),
             cookie: None,
             id: None,
@@ -586,6 +617,14 @@ impl SessionBuilder {
     /// the session reconnects.
     pub fn connector(&mut self, connect: impl Connector) -> &mut Self {
         self.connector = Arc::new(connect);
+        self
+    }
+
+    /// Configures the delays between reconnect attempts after the session
+    /// loses its connection to the ngrok service. Defaults to
+    /// [default_reconnect_backoff].
+    pub fn reconnect_backoff(&mut self, backoff: impl ReconnectBackoff) -> &mut Self {
+        self.reconnect_backoff = Arc::new(backoff);
         self
     }
 
@@ -1187,9 +1226,7 @@ async fn accept_incoming(mut incoming: IncomingStreams, inner: Arc<ArcSwap<Sessi
             //   a no-no.
             let error = parking_lot::Mutex::new(Some(error));
             let reconnect = RetryIf::spawn(
-                ExponentialBackoff::from_millis(50)
-                    .max_delay(Duration::from_secs(30))
-                    .map(jitter),
+                inner.load().builder.reconnect_backoff.delays(),
                 || try_reconnect(inner.clone(), error.lock().clone()).map_err(Arc::new),
                 |err: &Arc<ConnectError>| {
                     if let ConnectError::Canceled = **err {
