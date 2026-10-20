@@ -58,7 +58,10 @@ use tokio::{
     },
 };
 use tokio_retry::{
-    strategy::ExponentialBackoff,
+    strategy::{
+        jitter,
+        ExponentialBackoff,
+    },
     RetryIf,
 };
 use tokio_util::compat::{
@@ -1184,7 +1187,9 @@ async fn accept_incoming(mut incoming: IncomingStreams, inner: Arc<ArcSwap<Sessi
             //   a no-no.
             let error = parking_lot::Mutex::new(Some(error));
             let reconnect = RetryIf::spawn(
-                ExponentialBackoff::from_millis(50),
+                ExponentialBackoff::from_millis(50)
+                    .max_delay(Duration::from_secs(30))
+                    .map(jitter),
                 || try_reconnect(inner.clone(), error.lock().clone()).map_err(Arc::new),
                 |err: &Arc<ConnectError>| {
                     if let ConnectError::Canceled = **err {
