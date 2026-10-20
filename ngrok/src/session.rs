@@ -217,6 +217,7 @@ pub trait ReconnectBackoff: Sync + Send + 'static {
     ///
     /// Called each time the session loses its connection, so each disconnect
     /// starts from the first delay. Reconnecting stops when the iterator ends.
+    /// Delays longer than one day are reduced to one day.
     fn delays(&self) -> Box<dyn Iterator<Item = Duration> + Send>;
 }
 
@@ -1226,7 +1227,12 @@ async fn accept_incoming(mut incoming: IncomingStreams, inner: Arc<ArcSwap<Sessi
             //   a no-no.
             let error = parking_lot::Mutex::new(Some(error));
             let reconnect = RetryIf::spawn(
-                inner.load().builder.reconnect_backoff.delays(),
+                inner
+                    .load()
+                    .builder
+                    .reconnect_backoff
+                    .delays()
+                    .map(|delay| delay.min(Duration::from_secs(24 * 60 * 60))),
                 || try_reconnect(inner.clone(), error.lock().clone()).map_err(Arc::new),
                 |err: &Arc<ConnectError>| {
                     if let ConnectError::Canceled = **err {
